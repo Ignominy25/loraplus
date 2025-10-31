@@ -429,7 +429,7 @@ def main():
 
     # Get the metric function
     if data_args.task_name is not None:
-        metric = evaluate.load("nyu-mll/glue", data_args.task_name)
+        metric = evaluate.load("glue", data_args.task_name)
     else:
         metric = evaluate.load("accuracy")
 
