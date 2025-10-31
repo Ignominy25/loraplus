@@ -376,6 +376,8 @@ def main():
                 (label_to_id[l] if l != -1 else -1) for l in examples["label"]
             ]
         return result
+    
+    print(vars(training_args))
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
         raw_datasets = raw_datasets.map(
