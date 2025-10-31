@@ -16,10 +16,10 @@ def download_glue_tasks(task_names: Union[str, Iterable[str]], data_dir: str = "
     assert set(task_names).issubset(glue_tasks)
 
     for task_name in task_names:
-        save_dir = os.path.join(data_dir, "glue", task_name)
+        save_dir = os.path.join(data_dir, "nyu-mll/glue", task_name)
         os.makedirs(save_dir, exist_ok=True)
         raw_datasets = load_dataset(
-            "glue",
+            "nyu-mll/glue",
             task_name,
         )
         raw_datasets.save_to_disk(save_dir)

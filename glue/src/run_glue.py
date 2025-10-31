@@ -111,12 +111,12 @@ def main():
         # Downloading and loading a dataset from the hub.
         if data_args.use_local:
             raw_datasets = load_from_disk(
-                os.path.join(data_args.data_dir, "glue", data_args.task_name)
+                os.path.join(data_args.data_dir, "nyu-mll/glue", data_args.task_name)
             )
             datasets.set_caching_enabled(False)
         else:
             raw_datasets = load_dataset(
-                "glue",
+                "nyu-mll/glue",
                 data_args.task_name,
                 cache_dir=model_args.cache_dir,
                 token=True if model_args.token else None,
@@ -429,7 +429,7 @@ def main():
 
     # Get the metric function
     if data_args.task_name is not None:
-        metric = evaluate.load("glue", data_args.task_name)
+        metric = evaluate.load("nyu-mll/glue", data_args.task_name)
     else:
         metric = evaluate.load("accuracy")
 
@@ -557,7 +557,7 @@ def main():
     }
     if data_args.task_name is not None:
         kwargs["language"] = "en"
-        kwargs["dataset_tags"] = "glue"
+        kwargs["dataset_tags"] = "nyu-mll/glue"
         kwargs["dataset_args"] = data_args.task_name
         kwargs["dataset"] = f"GLUE {data_args.task_name.upper()}"
 
