@@ -108,6 +108,24 @@ class DataTrainingArguments:
         default=False, metadata={"help": "use local files for saved dataset"}
     )
     data_dir: str = field(default="data", metadata={"help": "location of local data"})
+    is_summarization: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to treat this as a summarization task. If True, will use seq2seq models and ROUGE metrics."
+        },
+    )
+    summarization_task_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The name of the summarization task: cnn_dailymail, xsum, gigaword, samsum, or custom dataset name."
+        },
+    )
+    summarization_config_name: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": "The configuration name for summarization dataset (e.g., '3.0.0' for cnn_dailymail)."
+        },
+    )
 
     def __post_init__(self):
         if self.task_name is not None:
@@ -117,11 +135,14 @@ class DataTrainingArguments:
                     "Unknown task, you should pick one in "
                     + ",".join(task_to_keys.keys())
                 )
+        elif self.summarization_task_name is not None:
+            # Summarization task is valid
+            pass
         elif self.dataset_name is not None:
             pass
         elif self.train_file is None or self.validation_file is None:
             raise ValueError(
-                "Need either a GLUE task, a training/validation file or a dataset name."
+                "Need either a GLUE task, a summarization task, a training/validation file or a dataset name."
             )
         else:
             train_extension = self.train_file.split(".")[-1]

@@ -17,7 +17,8 @@ from train_utils import train_model
 import transformers
 from peft import LoraConfig, get_peft_model
 from transformers import (AutoConfig, AutoModelForSequenceClassification,
-                          AutoTokenizer, DataCollatorWithPadding,
+                          AutoModelForSeq2SeqLM, AutoModelForCausalLM,
+                          AutoTokenizer, DataCollatorWithPadding, DataCollatorForSeq2Seq,
                           EvalPrediction, HfArgumentParser, LlamaTokenizer,
                           PretrainedConfig, default_data_collator, set_seed)
 from transformers.trainer_utils import get_last_checkpoint
@@ -95,6 +96,12 @@ def main():
     # Set seed before initializing model.
     set_seed(training_args.seed)
 
+    # Determine task type: classification or summarization
+    is_summarization = hasattr(data_args, 'is_summarization') and data_args.is_summarization
+    if data_args.dataset_name and any(name in data_args.dataset_name.lower() for name in ['cnn_dailymail', 'xsum', 'gigaword', 'samsum']):
+        is_summarization = True
+        logger.info("Detected summarization dataset")
+
     # Get the datasets: you can either provide your own CSV/JSON training and evaluation files (see below)
     # or specify a GLUE benchmark task (the dataset will be downloaded automatically from the datasets Hub).
     #
@@ -107,8 +114,51 @@ def main():
     #
     # In distributed training, the load_dataset function guarantee that only one local process can concurrently
     # download the dataset.
-    if data_args.task_name is not None:
-        # Downloading and loading a dataset from the hub.
+    if data_args.summarization_task_name is not None:
+        # Downloading and loading a summarization dataset from the hub
+        is_summarization = True
+        logger.info(f"Loading summarization dataset: {data_args.summarization_task_name}")
+        
+        # Map common summarization task names to their HuggingFace dataset names
+        summarization_dataset_mapping = {
+            "cnn_dailymail": ("cnn_dailymail", "3.0.0"),
+            "xsum": ("xsum", None),
+            "gigaword": ("gigaword", None),
+            "samsum": ("spencer/samsum_reformat", None),
+            "multi_news": ("multi_news", None),
+            "reddit_tifu": ("reddit_tifu", "long"),
+            "billsum": ("billsum", None),
+        }
+        
+        if data_args.summarization_task_name.lower() in summarization_dataset_mapping:
+            dataset_name, default_config = summarization_dataset_mapping[data_args.summarization_task_name.lower()]
+            config_name = data_args.summarization_config_name or default_config
+            logger.info(f"Using dataset: {dataset_name}, config: {config_name}")
+        else:
+            # Use the task name directly as dataset name
+            dataset_name = data_args.summarization_task_name
+            config_name = data_args.summarization_config_name
+            logger.info(f"Using custom dataset: {dataset_name}, config: {config_name}")
+        
+        if data_args.use_local:
+            # Load from local disk
+            local_path = os.path.join(data_args.data_dir, dataset_name)
+            if config_name:
+                local_path = os.path.join(local_path, config_name)
+            raw_datasets = load_from_disk(local_path)
+            datasets.set_caching_enabled(False)
+            logger.info(f"Loaded from local path: {local_path}")
+        else:
+            # Download from HuggingFace Hub
+            raw_datasets = load_dataset(
+                dataset_name,
+                config_name,
+                cache_dir=model_args.cache_dir,
+                token=True if model_args.token else None,
+            )
+            logger.info(f"Downloaded from HuggingFace Hub")
+    elif data_args.task_name is not None:
+        # Downloading and loading a GLUE dataset from the hub.
         if data_args.use_local:
             raw_datasets = load_from_disk(
                 os.path.join(data_args.data_dir, "nyu-mll/glue", data_args.task_name)
@@ -174,8 +224,12 @@ def main():
     # See more about loading any type of standard or custom dataset at
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
-    # Labels
-    if data_args.task_name is not None:
+    # Labels (for classification) or set up for summarization
+    is_regression = False
+    if is_summarization:
+        num_labels = None
+        logger.info("Setting up for summarization task")
+    elif data_args.task_name is not None:
         is_regression = data_args.task_name == "stsb"
         if not is_regression:
             label_list = raw_datasets["train"].features["label"].names
@@ -200,17 +254,22 @@ def main():
     # Load pretrained model and tokenizer
     # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
     # download model & vocab.
+    config_kwargs = {
+        "cache_dir": model_args.cache_dir,
+        "revision": model_args.model_revision,
+        "token": True if model_args.token else None,
+    }
+    if not is_summarization:
+        config_kwargs["num_labels"] = num_labels
+        config_kwargs["finetuning_task"] = data_args.task_name
+    
     config = AutoConfig.from_pretrained(
         (
             model_args.config_name
             if model_args.config_name
             else model_args.model_name_or_path
         ),
-        num_labels=num_labels,
-        finetuning_task=data_args.task_name,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=True if model_args.token else None,
+        **config_kwargs
     )
 
     tokenizer = AutoTokenizer.from_pretrained(
@@ -230,16 +289,46 @@ def main():
         if training_args.fp16
         else (torch.bfloat16 if training_args.bf16 else torch.float32)
     )
-    model = AutoModelForSequenceClassification.from_pretrained(
-        model_args.model_name_or_path,
-        from_tf=bool(".ckpt" in model_args.model_name_or_path),
-        torch_dtype=torch_dtype,
-        config=config,
-        cache_dir=model_args.cache_dir,
-        revision=model_args.model_revision,
-        token=True if model_args.token else None,
-        ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
-    )
+    
+    # Choose model class based on task type
+    if is_summarization:
+        # Check if it's an encoder-decoder model (like T5, BART) or decoder-only (like GPT)
+        if config.is_encoder_decoder:
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                torch_dtype=torch_dtype,
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                token=True if model_args.token else None,
+                ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+            )
+            logger.info("Using AutoModelForSeq2SeqLM for summarization")
+        else:
+            model = AutoModelForCausalLM.from_pretrained(
+                model_args.model_name_or_path,
+                from_tf=bool(".ckpt" in model_args.model_name_or_path),
+                torch_dtype=torch_dtype,
+                config=config,
+                cache_dir=model_args.cache_dir,
+                revision=model_args.model_revision,
+                token=True if model_args.token else None,
+                ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+            )
+            logger.info("Using AutoModelForCausalLM for summarization")
+    else:
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_args.model_name_or_path,
+            from_tf=bool(".ckpt" in model_args.model_name_or_path),
+            torch_dtype=torch_dtype,
+            config=config,
+            cache_dir=model_args.cache_dir,
+            revision=model_args.model_revision,
+            token=True if model_args.token else None,
+            ignore_mismatched_sizes=model_args.ignore_mismatched_sizes,
+        )
+        logger.info("Using AutoModelForSequenceClassification")
 
     if "gpt" in config.name_or_path:
         tokenizer.pad_token = tokenizer.eos_token
@@ -271,15 +360,29 @@ def main():
         assert target_modules is not None
         target_modules = target_modules.split(",")
         target_modules = [target_module.strip() for target_module in target_modules]
+        
+        # Determine task type and modules to save
+        if is_summarization:
+            if config.is_encoder_decoder:
+                task_type = "SEQ_2_SEQ_LM"
+                modules_to_save = ["lm_head"]
+            else:
+                task_type = "CAUSAL_LM"
+                modules_to_save = ["lm_head"]
+            logger.info(f"Using LoRA task type: {task_type}")
+        else:
+            task_type = "SEQ_CLS"
+            modules_to_save = ["classifier", "score"]
+        
         peft_config = LoraConfig(
-            task_type="SEQ_CLS",
+            task_type=task_type,
             fan_in_fan_out=True,
             target_modules=target_modules,
             r=training_args.lora_rank,
             lora_alpha=training_args.lora_alpha,
             lora_dropout=training_args.lora_dropout,
             use_original_init=training_args.lora_use_original_init,
-            modules_to_save=["classifier", "score"],
+            modules_to_save=modules_to_save,
         )
 
         if training_args.gradient_checkpointing:
@@ -298,7 +401,27 @@ def main():
                 param.requires_grad = False
 
     # Preprocessing the raw_datasets
-    if data_args.task_name is not None:
+    if is_summarization:
+        # Determine column names for summarization
+        if "article" in raw_datasets["train"].column_names:
+            text_column = "article"
+            summary_column = "highlights"
+        elif "document" in raw_datasets["train"].column_names:
+            text_column = "document"
+            summary_column = "summary"
+        elif "text" in raw_datasets["train"].column_names:
+            text_column = "text"
+            summary_column = "summary"
+        elif "dialogue" in raw_datasets["train"].column_names:
+            text_column = "dialogue"
+            summary_column = "summary"
+        else:
+            # Default to first two columns
+            cols = raw_datasets["train"].column_names
+            text_column = cols[0]
+            summary_column = cols[1] if len(cols) > 1 else "summary"
+        logger.info(f"Using columns: text={text_column}, summary={summary_column}")
+    elif data_args.task_name is not None:
         sentence1_key, sentence2_key = task_to_keys[data_args.task_name]
     else:
         # Again, we try to have some nice defaults but don't hesitate to tweak to your use case.
@@ -326,7 +449,8 @@ def main():
     # Some models have set the order of the labels to use, so let's make sure we do use it.
     label_to_id = None
     if (
-        model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
+        not is_summarization
+        and model.config.label2id != PretrainedConfig(num_labels=num_labels).label2id
         and data_args.task_name is not None
         and not is_regression
     ):
@@ -342,13 +466,13 @@ def main():
                 f"model labels: {sorted(label_name_to_id.keys())}, dataset labels: {sorted(label_list)}."
                 "\nIgnoring the model labels as a result.",
             )
-    elif data_args.task_name is None and not is_regression:
+    elif data_args.task_name is None and not is_regression and not is_summarization:
         label_to_id = {v: i for i, v in enumerate(label_list)}
 
-    if label_to_id is not None:
+    if label_to_id is not None and not is_summarization:
         model.config.label2id = label_to_id
         model.config.id2label = {id: label for label, id in config.label2id.items()}
-    elif data_args.task_name is not None and not is_regression:
+    elif data_args.task_name is not None and not is_regression and not is_summarization:
         model.config.label2id = {l: i for i, l in enumerate(label_list)}
         model.config.id2label = {id: label for label, id in config.label2id.items()}
 
@@ -360,22 +484,46 @@ def main():
     max_seq_length = min(data_args.max_seq_length, tokenizer.model_max_length)
 
     def preprocess_function(examples):
-        # Tokenize the texts
-        args = (
-            (examples[sentence1_key],)
-            if sentence2_key is None
-            else (examples[sentence1_key], examples[sentence2_key])
-        )
-        result = tokenizer(
-            *args, padding=padding, max_length=max_seq_length, truncation=True
-        )
+        if is_summarization:
+            # Tokenize inputs and targets for summarization
+            inputs = examples[text_column]
+            targets = examples[summary_column]
+            
+            model_inputs = tokenizer(
+                inputs, 
+                max_length=max_seq_length, 
+                padding=padding, 
+                truncation=True
+            )
+            
+            # Setup the tokenizer for targets
+            with tokenizer.as_target_tokenizer():
+                labels = tokenizer(
+                    targets, 
+                    max_length=128,  # Typically summaries are shorter
+                    padding=padding, 
+                    truncation=True
+                )
+            
+            model_inputs["labels"] = labels["input_ids"]
+            return model_inputs
+        else:
+            # Tokenize the texts for classification
+            args = (
+                (examples[sentence1_key],)
+                if sentence2_key is None
+                else (examples[sentence1_key], examples[sentence2_key])
+            )
+            result = tokenizer(
+                *args, padding=padding, max_length=max_seq_length, truncation=True
+            )
 
-        # Map labels to IDs (not necessary for GLUE tasks)
-        if label_to_id is not None and "label" in examples:
-            result["label"] = [
-                (label_to_id[l] if l != -1 else -1) for l in examples["label"]
-            ]
-        return result
+            # Map labels to IDs (not necessary for GLUE tasks)
+            if label_to_id is not None and "label" in examples:
+                result["label"] = [
+                    (label_to_id[l] if l != -1 else -1) for l in examples["label"]
+                ]
+            return result
 
     with training_args.main_process_first(desc="dataset map pre-processing"):
         raw_datasets = raw_datasets.map(
@@ -428,7 +576,10 @@ def main():
             logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
 
     # Get the metric function
-    if data_args.task_name is not None:
+    if is_summarization:
+        metric = evaluate.load("rouge")
+        logger.info("Using ROUGE metric for summarization")
+    elif data_args.task_name is not None:
         metric = evaluate.load("glue", data_args.task_name)
     else:
         metric = evaluate.load("accuracy")
@@ -436,21 +587,55 @@ def main():
     # You can define your custom compute_metrics function. It takes an `EvalPrediction` object (a namedtuple with a
     # predictions and label_ids field) and has to return a dictionary string to float.
     def compute_metrics(p: EvalPrediction):
-        preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
-        preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
-        if data_args.task_name is not None:
-            result = metric.compute(predictions=preds, references=p.label_ids)
-            if len(result) > 1:
-                result["combined_score"] = np.mean(list(result.values())).item()
+        if is_summarization:
+            preds = p.predictions
+            labels = p.label_ids
+            
+            # Decode predictions and labels
+            if isinstance(preds, tuple):
+                preds = preds[0]
+            
+            # Replace -100 in labels as we can't decode them
+            labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+            
+            decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+            decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+            
+            # Compute ROUGE scores
+            result = metric.compute(
+                predictions=decoded_preds, 
+                references=decoded_labels,
+                use_stemmer=True
+            )
+            
+            # Extract mid F-scores
+            result = {k: v.mid.fmeasure * 100 for k, v in result.items()}
             return result
-        elif is_regression:
-            return {"mse": ((preds - p.label_ids) ** 2).mean().item()}
         else:
-            return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
+            preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
+            preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
+            if data_args.task_name is not None:
+                result = metric.compute(predictions=preds, references=p.label_ids)
+                if len(result) > 1:
+                    result["combined_score"] = np.mean(list(result.values())).item()
+                return result
+            elif is_regression:
+                return {"mse": ((preds - p.label_ids) ** 2).mean().item()}
+            else:
+                return {"accuracy": (preds == p.label_ids).astype(np.float32).mean().item()}
 
     # Data collator will default to DataCollatorWithPadding when the tokenizer is passed to Trainer, so we change it if
     # we already did the padding.
-    if data_args.pad_to_max_length:
+    if is_summarization:
+        # Use DataCollatorForSeq2Seq for summarization tasks
+        data_collator = DataCollatorForSeq2Seq(
+            tokenizer,
+            model=model,
+            label_pad_token_id=-100,
+            pad_to_multiple_of=8 if training_args.fp16 else None,
+        )
+        logger.info("Using DataCollatorForSeq2Seq")
+    elif data_args.pad_to_max_length:
         data_collator = default_data_collator
     elif training_args.fp16:
         data_collator = DataCollatorWithPadding(tokenizer, pad_to_multiple_of=8)
@@ -458,15 +643,26 @@ def main():
         data_collator = None
 
     # Initialize our Trainer
-    trainer = LoraPlusTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=train_dataset if training_args.do_train else None,
-        eval_dataset=eval_dataset if training_args.do_eval else None,
-        compute_metrics=compute_metrics,
-        tokenizer=tokenizer,
-        data_collator=data_collator,
-    )
+    trainer_kwargs = {
+        "model": model,
+        "args": training_args,
+        "train_dataset": train_dataset if training_args.do_train else None,
+        "eval_dataset": eval_dataset if training_args.do_eval else None,
+        "compute_metrics": compute_metrics,
+        "tokenizer": tokenizer,
+        "data_collator": data_collator,
+    }
+    
+    # Add generation config for summarization
+    if is_summarization:
+        # Set up generation parameters
+        model.config.max_length = 128
+        model.config.num_beams = 4
+        model.config.length_penalty = 2.0
+        model.config.early_stopping = True
+        logger.info("Configured generation parameters for summarization")
+    
+    trainer = LoraPlusTrainer(**trainer_kwargs)
 
     # Training
     if training_args.do_train:
@@ -482,74 +678,115 @@ def main():
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
 
-        # Loop to handle MNLI double evaluation (matched, mis-matched)
-        tasks = [data_args.task_name]
-        eval_datasets = [eval_dataset]
-        if data_args.task_name == "mnli":
-            tasks.append("mnli-mm")
-            valid_mm_dataset = raw_datasets["validation_mismatched"]
-            if data_args.max_eval_samples is not None:
-                max_eval_samples = min(
-                    len(valid_mm_dataset), data_args.max_eval_samples
-                )
-                valid_mm_dataset = valid_mm_dataset.select(range(max_eval_samples))
-            eval_datasets.append(valid_mm_dataset)
-            combined = {}
-
-        for eval_dataset, task in zip(eval_datasets, tasks):
+        if is_summarization:
+            # Simpler eval for summarization
             metrics = trainer.evaluate(eval_dataset=eval_dataset)
-
+            
             max_eval_samples = (
                 data_args.max_eval_samples
                 if data_args.max_eval_samples is not None
                 else len(eval_dataset)
             )
             metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
-
-            if task == "mnli-mm":
-                metrics = {k + "_mm": v for k, v in metrics.items()}
-            if task is not None and "mnli" in task:
-                combined.update(metrics)
-
+            
             trainer.log_metrics("eval", metrics)
-            trainer.save_metrics(
-                "eval", combined if task is not None and "mnli" in task else metrics
-            )
+            trainer.save_metrics("eval", metrics)
+        else:
+            # Loop to handle MNLI double evaluation (matched, mis-matched)
+            tasks = [data_args.task_name]
+            eval_datasets = [eval_dataset]
+            if data_args.task_name == "mnli":
+                tasks.append("mnli-mm")
+                valid_mm_dataset = raw_datasets["validation_mismatched"]
+                if data_args.max_eval_samples is not None:
+                    max_eval_samples = min(
+                        len(valid_mm_dataset), data_args.max_eval_samples
+                    )
+                    valid_mm_dataset = valid_mm_dataset.select(range(max_eval_samples))
+                eval_datasets.append(valid_mm_dataset)
+                combined = {}
+
+            for eval_dataset, task in zip(eval_datasets, tasks):
+                metrics = trainer.evaluate(eval_dataset=eval_dataset)
+
+                max_eval_samples = (
+                    data_args.max_eval_samples
+                    if data_args.max_eval_samples is not None
+                    else len(eval_dataset)
+                )
+                metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+
+                if task == "mnli-mm":
+                    metrics = {k + "_mm": v for k, v in metrics.items()}
+                if task is not None and "mnli" in task:
+                    combined.update(metrics)
+
+                trainer.log_metrics("eval", metrics)
+                trainer.save_metrics(
+                    "eval", combined if task is not None and "mnli" in task else metrics
+                )
     if training_args.do_predict:
         logger.info("*** Predict ***")
 
-        # Loop to handle MNLI double evaluation (matched, mis-matched)
-        tasks = [data_args.task_name]
-        predict_datasets = [predict_dataset]
-        if data_args.task_name == "mnli":
-            tasks.append("mnli-mm")
-            predict_datasets.append(raw_datasets["test_mismatched"])
-
-        for predict_dataset, task in zip(predict_datasets, tasks):
-            # Removing the `label` columns because it contains -1 and Trainer won't like that.
-            predict_dataset = predict_dataset.remove_columns("label")
+        if is_summarization:
+            # Simpler prediction for summarization
             predictions = trainer.predict(
                 predict_dataset, metric_key_prefix="predict"
-            ).predictions
-            predictions = (
-                np.squeeze(predictions)
-                if is_regression
-                else np.argmax(predictions, axis=1)
             )
-
+            
+            # Decode predictions
+            preds = predictions.predictions
+            if isinstance(preds, tuple):
+                preds = preds[0]
+            
+            decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+            
+            # Save predictions
+            task_name = data_args.summarization_task_name or "summarization"
             output_predict_file = os.path.join(
-                training_args.output_dir, f"predict_results_{task}.txt"
+                training_args.output_dir, f"predict_results_{task_name}.txt"
             )
             if trainer.is_world_process_zero():
                 with open(output_predict_file, "w") as writer:
-                    logger.info(f"***** Predict results {task} *****")
+                    logger.info(f"***** Predict results {task_name} *****")
                     writer.write("index\tprediction\n")
-                    for index, item in enumerate(predictions):
-                        if is_regression:
-                            writer.write(f"{index}\t{item:3.3f}\n")
-                        else:
-                            item = label_list[item]
-                            writer.write(f"{index}\t{item}\n")
+                    for index, pred in enumerate(decoded_preds):
+                        # Replace newlines to keep one prediction per line
+                        pred = pred.replace("\n", " ")
+                        writer.write(f"{index}\t{pred}\n")
+        else:
+            # Loop to handle MNLI double evaluation (matched, mis-matched)
+            tasks = [data_args.task_name]
+            predict_datasets = [predict_dataset]
+            if data_args.task_name == "mnli":
+                tasks.append("mnli-mm")
+                predict_datasets.append(raw_datasets["test_mismatched"])
+
+            for predict_dataset, task in zip(predict_datasets, tasks):
+                # Removing the `label` columns because it contains -1 and Trainer won't like that.
+                predict_dataset = predict_dataset.remove_columns("label")
+                predictions = trainer.predict(
+                    predict_dataset, metric_key_prefix="predict"
+                ).predictions
+                predictions = (
+                    np.squeeze(predictions)
+                    if is_regression
+                    else np.argmax(predictions, axis=1)
+                )
+
+                output_predict_file = os.path.join(
+                    training_args.output_dir, f"predict_results_{task}.txt"
+                )
+                if trainer.is_world_process_zero():
+                    with open(output_predict_file, "w") as writer:
+                        logger.info(f"***** Predict results {task} *****")
+                        writer.write("index\tprediction\n")
+                        for index, item in enumerate(predictions):
+                            if is_regression:
+                                writer.write(f"{index}\t{item:3.3f}\n")
+                            else:
+                                item = label_list[item]
+                                writer.write(f"{index}\t{item}\n")
 
     kwargs = {
         "finetuned_from": model_args.model_name_or_path,

@@ -30,6 +30,14 @@ class LoraPlusTrainingArguments(TrainingArguments):
         default=1e-6,
         metadata={"help": "loraplus learning rate for lora embedding layers."},
     )
+    lr_step_size: int = field(
+        default=100,
+        metadata={"help": "Number of steps after which the learning rate is updated."},
+    )
+    lr_gamma: float = field(
+        default=0.1,
+        metadata={"help": "Factor by which the learning rate is multiplied at each step."},
+    )
 
 
 def get_module(name, opt_model):
@@ -149,6 +157,45 @@ def create_loraplus_optimizer(
     return optimizer
 
 
+class CustomLRScheduler:
+    def __init__(self, optimizer, lr_step_size, lr_gamma, loraplus_lr_ratio):
+        self.optimizer = optimizer
+        self.lr_step_size = lr_step_size
+        self.lr_gamma = lr_gamma
+        self.loraplus_lr_ratio = loraplus_lr_ratio
+        self.step_count = 0
+
+    def step(self):
+        self.step_count += 1
+        if self.step_count % self.lr_step_size == 0:
+            for param_group in self.optimizer.param_groups:
+                # Apply lr_gamma only to groupB and groupB_no_decay
+                if param_group.get("lr") and param_group["lr"] not in [
+                    self.optimizer.defaults.get("lr"),  # groupA
+                    param_group.get("loraplus_lr_embedding"),  # embedding
+                ]:
+                    param_group["lr"] *= self.lr_gamma
+
+        # Log the current ratio of learning rates for groupA and groupB
+        groupA_lr = None
+        groupB_lr = None
+        for param_group in self.optimizer.param_groups:
+            if param_group.get("lr") == self.optimizer.defaults.get("lr"):
+                groupA_lr = param_group["lr"]
+            elif param_group.get("lr") and param_group["lr"] != self.optimizer.defaults.get("lr"):
+                groupB_lr = param_group["lr"]
+
+        if groupA_lr is not None and groupB_lr is not None and (self.step_count % self.lr_step_size == 0):
+            current_ratio = groupB_lr / groupA_lr
+            print(f"\n[DEBUG] Step {self.step_count}: Current Ratio (groupB/groupA): {current_ratio}")
+
+    def get_last_lr(self):
+        """
+        Returns the current learning rates for all parameter groups.
+        """
+        return [param_group["lr"] for param_group in self.optimizer.param_groups]
+
+
 class LoraPlusTrainer(Trainer):
     def __init__(
         self,
@@ -188,7 +235,7 @@ class LoraPlusTrainer(Trainer):
 
     def create_optimizer(self):
         """
-        Overrides the method to create an optimizer with LoRA+ specific adjustments.
+        Overrides the method to create an optimizer with LoRA+ specific adjustments and integrates a custom lr_ratio scheduler.
         """
         if self.args.loraplus_lr_ratio is None:
             return super().create_optimizer()
@@ -209,7 +256,28 @@ class LoraPlusTrainer(Trainer):
                 loraplus_lr_embedding,
             )
 
+            # Integrate custom lr_ratio scheduler
+            self.lr_scheduler = CustomLRScheduler(
+                self.optimizer,
+                lr_step_size=self.args.lr_step_size,
+                lr_gamma=self.args.lr_gamma,
+                loraplus_lr_ratio=self.args.loraplus_lr_ratio,
+            )
+
         if is_sagemaker_mp_enabled():
             self.optimizer = smp.DistributedOptimizer(self.optimizer)
 
         return self.optimizer
+
+    def training_step(self, *args, **kwargs):
+        """
+        Overrides the training step to update the custom lr_ratio scheduler.
+        """
+        # Perform the standard training step
+        output = super().training_step(*args, **kwargs)
+
+        # Update the custom lr_ratio scheduler
+        if hasattr(self, 'lr_scheduler'):
+            self.lr_scheduler.step()
+
+        return output
