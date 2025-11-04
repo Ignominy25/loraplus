@@ -674,13 +674,8 @@ def main():
     if is_summarization:
         # Enable generation for evaluation
         training_args.predict_with_generate = True
-        
-        # Set up generation parameters on model from training_args
-        model.config.max_length = training_args.generation_max_length
-        model.config.num_beams = training_args.generation_num_beams
-        model.config.length_penalty = training_args.generation_length_penalty
-        model.config.early_stopping = training_args.generation_early_stopping
-        
+        # Note: Generation parameters (max_length, num_beams, etc.) are passed
+        # directly to model.generate() in prediction_step, not set on model.config
     
     trainer = LoraPlusTrainer(**trainer_kwargs)
 
@@ -699,6 +694,14 @@ def main():
         logger.info("*** Evaluate ***")
 
         if is_summarization:
+            # Log generation config once before evaluation
+            logger.info(
+                f"Generation Config: max_length={training_args.generation_max_length}, "
+                f"num_beams={training_args.generation_num_beams}, "
+                f"length_penalty={training_args.generation_length_penalty}, "
+                f"early_stopping={training_args.generation_early_stopping}"
+            )
+            
             # Simpler eval for summarization
             metrics = trainer.evaluate(eval_dataset=eval_dataset)
             

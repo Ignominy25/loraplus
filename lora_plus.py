@@ -139,21 +139,25 @@ def create_loraplus_optimizer(
             "params": list(param_groups["groupA"].values()),
             "weight_decay": weight_decay,
             "lr": lr,
+            "loraplus_group_name": "groupA",  # Explicit label
         },
         {
             "params": list(param_groups["embedding"].values()),
             "weight_decay": weight_decay,
             "lr": loraplus_lr_embedding,
+            "loraplus_group_name": "embedding",  # Explicit label
         },
         {
             "params": list(param_groups["groupB"].values()),
             "weight_decay": weight_decay,
             "lr": lr * loraplus_lr_ratio,
+            "loraplus_group_name": "groupB",  # Explicit label
         },
         {
             "params": list(param_groups["groupB_no_decay"].values()),
             "weight_decay": 0.0,
             "lr": lr * loraplus_lr_ratio,
+            "loraplus_group_name": "groupB_no_decay",  # Explicit label
         },
     ]
 
@@ -189,31 +193,61 @@ class CustomLRScheduler:
         self.step_count += 1
         if self.step_count % self.lr_step_size == 0:
             for param_group in self.optimizer.param_groups:
-                # Apply lr_gamma only to groupB and groupB_no_decay
-                if param_group.get("lr") and param_group["lr"] not in [
-                    self.optimizer.defaults.get("lr"),  # groupA
-                    param_group.get("loraplus_lr_embedding"),  # embedding
-                ]:
+                # Apply lr_gamma only to groupB and groupB_no_decay (not groupA or embedding)
+                group_name = param_group.get("loraplus_group_name")
+                if group_name in ["groupB", "groupB_no_decay"]:
                     param_group["lr"] *= self.lr_gamma
 
         # Log the current ratio of learning rates for groupA and groupB
-        groupA_lr = None
-        groupB_lr = None
-        for param_group in self.optimizer.param_groups:
-            if param_group.get("lr") == self.optimizer.defaults.get("lr"):
-                groupA_lr = param_group["lr"]
-            elif param_group.get("lr") and param_group["lr"] != self.optimizer.defaults.get("lr"):
-                groupB_lr = param_group["lr"]
-
-        if groupA_lr is not None and groupB_lr is not None and (self.step_count % self.lr_step_size == 0):
-            current_ratio = groupB_lr / groupA_lr
-            print(f"\n[DEBUG] Step {self.step_count}: Current Ratio (groupB/groupA): {current_ratio}")
+        if self.step_count % self.lr_step_size == 0:
+            groupA_lr = None
+            groupB_lr = None
+            
+            # Use explicit labels to identify groups
+            for param_group in self.optimizer.param_groups:
+                group_name = param_group.get("loraplus_group_name")
+                if group_name == "groupA":
+                    groupA_lr = param_group["lr"]
+                elif group_name == "groupB" or group_name == "groupB_no_decay":
+                    groupB_lr = param_group["lr"]  # Both groupB variants have same lr
+            
+            if groupA_lr is not None and groupB_lr is not None:
+                current_ratio = groupB_lr / groupA_lr
+                # Use tqdm.write to avoid interrupting progress bars
+                try:
+                    from tqdm import tqdm
+                    tqdm.write(f"[LoRA+ Ratio] Step {self.step_count}: {current_ratio:.4f}")
+                except ImportError:
+                    # Fallback if tqdm not available
+                    print(f"[LoRA+ Ratio] Step {self.step_count}: {current_ratio:.4f} (groupA_lr={groupA_lr:.6f}, groupB_lr={groupB_lr:.6f})")
 
     def get_last_lr(self):
         """
         Returns the current learning rates for all parameter groups.
         """
         return [param_group["lr"] for param_group in self.optimizer.param_groups]
+
+    def state_dict(self):
+        """
+        Returns the state of the scheduler as a dict.
+        Required for checkpoint saving.
+        """
+        return {
+            "step_count": self.step_count,
+            "lr_step_size": self.lr_step_size,
+            "lr_gamma": self.lr_gamma,
+            "loraplus_lr_ratio": self.loraplus_lr_ratio,
+        }
+
+    def load_state_dict(self, state_dict):
+        """
+        Loads the schedulers state.
+        Required for checkpoint loading.
+        """
+        self.step_count = state_dict["step_count"]
+        self.lr_step_size = state_dict["lr_step_size"]
+        self.lr_gamma = state_dict["lr_gamma"]
+        self.loraplus_lr_ratio = state_dict["loraplus_lr_ratio"]
 
 
 class LoraPlusTrainer(Trainer):
