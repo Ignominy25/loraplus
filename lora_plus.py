@@ -38,6 +38,26 @@ class LoraPlusTrainingArguments(TrainingArguments):
         default=0.1,
         metadata={"help": "Factor by which the learning rate is multiplied at each step."},
     )
+    predict_with_generate: bool = field(
+        default=False,
+        metadata={"help": "Whether to use generate() for predictions (for seq2seq models)."},
+    )
+    generation_max_length: int = field(
+        default=128,
+        metadata={"help": "Maximum length for generation."},
+    )
+    generation_num_beams: int = field(
+        default=4,
+        metadata={"help": "Number of beams for generation."},
+    )
+    generation_length_penalty: float = field(
+        default=2.0,
+        metadata={"help": "Length penalty for generation. Values > 1.0 encourage longer sequences."},
+    )
+    generation_early_stopping: bool = field(
+        default=True,
+        metadata={"help": "Whether to stop beam search when at least num_beams sentences are finished."},
+    )
 
 
 def get_module(name, opt_model):
@@ -281,3 +301,45 @@ class LoraPlusTrainer(Trainer):
             self.lr_scheduler.step()
 
         return output
+    
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only,
+        ignore_keys=None,
+    ):
+        """
+        Override prediction_step to support generation for seq2seq models.
+        """
+        # Check if model has generate method (seq2seq models like T5, BART)
+        if hasattr(model, "generate") and self.args.predict_with_generate:
+            has_labels = "labels" in inputs
+            inputs = self._prepare_inputs(inputs)
+            
+            # Generate predictions
+            gen_kwargs = {
+                "input_ids": inputs["input_ids"],
+                "attention_mask": inputs["attention_mask"],
+                "max_length": self.args.generation_max_length if hasattr(self.args, 'generation_max_length') else 128,
+                "num_beams": self.args.generation_num_beams if hasattr(self.args, 'generation_num_beams') else 4,
+            }
+            
+            generated_tokens = model.generate(**gen_kwargs)
+            
+            # Compute loss if labels are present
+            if has_labels:
+                with torch.no_grad():
+                    outputs = model(**inputs)
+                    loss = outputs.loss
+            else:
+                loss = None
+            
+            labels = inputs.get("labels")
+            
+            # Keep as tensors for the Trainer's evaluation loop
+            # They will be converted to numpy later in compute_metrics
+            return (loss, generated_tokens, labels)
+        else:
+            # Fall back to default behavior for classification
+            return super().prediction_step(model, inputs, prediction_loss_only, ignore_keys)

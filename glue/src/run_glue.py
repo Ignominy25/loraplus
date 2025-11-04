@@ -595,8 +595,18 @@ def main():
             if isinstance(preds, tuple):
                 preds = preds[0]
             
-            # Replace -100 in labels as we can't decode them
+            # Convert to numpy array and ensure proper shape
+            preds = np.asarray(preds)
+            labels = np.asarray(labels)
+            preds = np.asarray(preds)
+            
+            # Replace -100 in both labels and predictions as we can't decode them
             labels = np.where(labels != -100, labels, tokenizer.pad_token_id)
+            preds = np.where(preds != -100, preds, tokenizer.pad_token_id)
+            
+            # Ensure predictions are integer type and convert to list of lists
+            preds = preds.astype(np.int64).tolist()
+            labels = labels.astype(np.int64).tolist()
             
             decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
             decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
@@ -608,9 +618,16 @@ def main():
                 use_stemmer=True
             )
             
-            # Extract mid F-scores
-            result = {k: v.mid.fmeasure * 100 for k, v in result.items()}
-            return result
+            # Extract scores - handle both old (Score objects) and new (float) formats
+            formatted_result = {}
+            for k, v in result.items():
+                if hasattr(v, 'mid'):
+                    # Old format: Score object with .mid.fmeasure
+                    formatted_result[k] = v.mid.fmeasure * 100
+                else:
+                    # New format: already a float (0-1 range)
+                    formatted_result[k] = v * 100
+            return formatted_result
         else:
             preds = p.predictions[0] if isinstance(p.predictions, tuple) else p.predictions
             preds = np.squeeze(preds) if is_regression else np.argmax(preds, axis=1)
@@ -655,12 +672,15 @@ def main():
     
     # Add generation config for summarization
     if is_summarization:
-        # Set up generation parameters
-        model.config.max_length = 128
-        model.config.num_beams = 4
-        model.config.length_penalty = 2.0
-        model.config.early_stopping = True
-        logger.info("Configured generation parameters for summarization")
+        # Enable generation for evaluation
+        training_args.predict_with_generate = True
+        
+        # Set up generation parameters on model from training_args
+        model.config.max_length = training_args.generation_max_length
+        model.config.num_beams = training_args.generation_num_beams
+        model.config.length_penalty = training_args.generation_length_penalty
+        model.config.early_stopping = training_args.generation_early_stopping
+        
     
     trainer = LoraPlusTrainer(**trainer_kwargs)
 
