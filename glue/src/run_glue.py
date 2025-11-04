@@ -611,6 +611,16 @@ def main():
             decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
             decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
             
+            # DEBUG: Print first 3 examples
+            logger.info("="*80)
+            logger.info("SAMPLE PREDICTIONS (first 3 examples):")
+            for i in range(min(3, len(decoded_preds))):
+                logger.info(f"\nExample {i+1}:")
+                logger.info(f"Prediction: {decoded_preds[i]}")
+                logger.info(f"Reference:  {decoded_labels[i]}")
+                logger.info(f"Pred length: {len(decoded_preds[i])}, Ref length: {len(decoded_labels[i])}")
+            logger.info("="*80)
+            
             # Compute ROUGE scores
             result = metric.compute(
                 predictions=decoded_preds, 
